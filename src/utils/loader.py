@@ -162,6 +162,8 @@ def load_from_local_dir(
         use_quant_conv=vae_config.get("use_quant_conv", True),
         use_post_quant_conv=vae_config.get("use_post_quant_conv", True),
         mid_block_add_attention=vae_config.get("mid_block_add_attention", True),
+        alpha_out_channels=vae_config.get("alpha_out_channels", 1),
+        alpha_head_channels=vae_config.get("alpha_head_channels", None),
     )
 
     # VAE (fp32 for better precision)

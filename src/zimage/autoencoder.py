@@ -10,7 +10,22 @@ import torch.nn as nn
 
 @dataclass
 class AutoencoderKLOutput:
+    """Decoded RGBA tensor.
+
+    The first three channels of ``sample`` use the VAE's existing RGB range.
+    The final channel contains alpha logits and should only be passed through a
+    sigmoid when an opacity value is needed.
+    """
+
     sample: torch.Tensor
+
+    @property
+    def rgb(self) -> torch.Tensor:
+        return self.sample[:, :3]
+
+    @property
+    def alpha_logits(self) -> torch.Tensor:
+        return self.sample[:, 3:4]
 
 
 class AutoencoderConfig:
@@ -252,7 +267,9 @@ class Encoder(nn.Module):
         return x
 
 
-class Decoder(nn.Module):
+class AlphaDecoder(nn.Module):
+    """VAE decoder with a lightweight alpha head on its final features."""
+
     def __init__(
         self,
         in_channels=3,
@@ -260,8 +277,13 @@ class Decoder(nn.Module):
         block_out_channels=(64,),
         layers_per_block=2,
         norm_num_groups=32,
+        alpha_out_channels=1,
+        alpha_head_channels=None,
     ):
         super().__init__()
+        if alpha_out_channels != 1:
+            raise ValueError("AlphaDecoder currently requires alpha_out_channels=1.")
+
         self.conv_in = nn.Conv2d(in_channels, block_out_channels[-1], kernel_size=3, stride=1, padding=1)
 
         self.mid_block = UNetMidBlock2D(
@@ -290,15 +312,30 @@ class Decoder(nn.Module):
         self.conv_act = nn.SiLU()
         self.conv_out = nn.Conv2d(block_out_channels[0], out_channels, kernel_size=3, padding=1)
 
+        # Branch from the same full-resolution features used by the RGB output.
+        # Keep ``conv_out`` unchanged so existing RGB VAE checkpoints load
+        # without remapping any decoder weights.
+        alpha_head_channels = alpha_head_channels or max(block_out_channels[0] // 2, 16)
+        self.alpha_head = nn.Sequential(
+            nn.Conv2d(block_out_channels[0], alpha_head_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(alpha_head_channels, alpha_out_channels, kernel_size=1),
+        )
+
     def forward(self, x):
         x = self.conv_in(x)
         x = self.mid_block(x)
         for block in self.up_blocks:
             x = block(x)
         x = self.conv_norm_out(x)
-        x = self.conv_act(x)
-        x = self.conv_out(x)
-        return x
+        features = self.conv_act(x)
+        rgb = self.conv_out(features)
+        alpha_logits = self.alpha_head(features)
+        return torch.cat((rgb, alpha_logits), dim=1)
+
+
+# Backward-compatible import name for callers that imported Decoder directly.
+Decoder = AlphaDecoder
 
 
 class AutoencoderKL(nn.Module):
@@ -320,6 +357,8 @@ class AutoencoderKL(nn.Module):
         use_quant_conv: bool = True,
         use_post_quant_conv: bool = True,
         mid_block_add_attention: bool = True,
+        alpha_out_channels: int = 1,
+        alpha_head_channels: Optional[int] = None,
         **kwargs,
     ):
         super().__init__()
@@ -331,6 +370,8 @@ class AutoencoderKL(nn.Module):
             latent_channels=latent_channels,
             scaling_factor=scaling_factor,
             shift_factor=shift_factor,
+            alpha_out_channels=alpha_out_channels,
+            alpha_head_channels=alpha_head_channels,
         )
 
         self.encoder = Encoder(
@@ -342,12 +383,14 @@ class AutoencoderKL(nn.Module):
             double_z=True,
         )
 
-        self.decoder = Decoder(
+        self.decoder = AlphaDecoder(
             in_channels=latent_channels,
             out_channels=out_channels,
             block_out_channels=block_out_channels,
             layers_per_block=layers_per_block,
             norm_num_groups=norm_num_groups,
+            alpha_out_channels=alpha_out_channels,
+            alpha_head_channels=alpha_head_channels,
         )
 
         self.quant_conv = nn.Conv2d(2 * latent_channels, 2 * latent_channels, 1) if use_quant_conv else None

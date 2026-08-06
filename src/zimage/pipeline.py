@@ -285,7 +285,12 @@ def generate(
     if output_type == "pil":
         from PIL import Image
 
-        image = (image / 2 + 0.5).clamp(0, 1)
+        rgb = (image[:, :3] / 2 + 0.5).clamp(0, 1)
+        if image.shape[1] == 4:
+            alpha = image[:, 3:4].sigmoid()
+            image = torch.cat((rgb, alpha), dim=1)
+        else:
+            image = rgb
         image = image.cpu().permute(0, 2, 3, 1).float().numpy()
         image = (image * 255).round().astype("uint8")
         image = [Image.fromarray(img) for img in image]
