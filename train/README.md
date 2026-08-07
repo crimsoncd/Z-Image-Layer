@@ -41,3 +41,20 @@ Each checkpoint stores only parameters selected for training:
 `training_state.json`. Pass the checkpoint directory to `--resume` to load those
 weights. Optimizer state is intentionally not stored, so resuming restarts the
 learning-rate schedule while retaining `global_step` for naming/logging.
+
+## Test a checkpoint
+
+The test script loads the original model first and then applies the trainable
+weight files from a checkpoint:
+
+```powershell
+D:\Miniconda\envs\Steel\python.exe train\test_alpha.py `
+  --model-dir ckpts\Z-Image-Turbo `
+  --checkpoint outputs\alpha-training\checkpoint-1000 `
+  --prompt "a ceramic teapot, isolated object, transparent background" `
+  --output outputs\teapot.png `
+  --height 512 --width 512 --seed 42
+```
+
+The saved PNG is RGBA. The script also prints the minimum, maximum, and mean
+opacity so a fully opaque or collapsed alpha prediction is easy to notice.
