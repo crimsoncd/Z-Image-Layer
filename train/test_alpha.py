@@ -19,18 +19,18 @@ from utils import load_from_local_dir, set_attention_backend  # noqa: E402
 from zimage import generate  # noqa: E402
 
 
-DEFAULT_PROMPT  = "<object>market stall left</object><bbox>[0, 370, 255, 900]</bbox><layer>1</layer>"
-
+DEFAULT_PROMPT  = "A striped orange and cream canopy market stall with two vendors wearing aprons, one in blue and one in yellow, standing behind a counter with baskets of produce and hanging yellow lanterns."
+DEFAULT_MODEL_PATH = "/remote-home/Zhangkaile/models/Z-Image/"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-dir", type=Path, required=True, help="Original Z-Image model directory.")
+    parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_PATH, help="Original Z-Image model directory.")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Training checkpoint-N directory.")
     parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT)
-    parser.add_argument("--output", type=Path, default=Path("alpha-test.png"))
+    parser.add_argument("--output", type=Path, default=Path("train/alpha-test.png"))
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
-    parser.add_argument("--steps", type=int, default=8)
+    parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=0.0)
     parser.add_argument("--negative-prompt", default=None)
     parser.add_argument("--seed", type=int, default=42)

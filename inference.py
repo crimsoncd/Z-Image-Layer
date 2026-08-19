@@ -12,13 +12,13 @@ from zimage import generate
 
 
 def main():
-    model_path = ensure_model_weights("ckpts/Z-Image-Turbo", verify=False)  # True to verify with md5
+    model_path = ensure_model_weights("/remote-home/Zhangkaile/models/Z-Image/", verify=False)  # True to verify with md5
     dtype = torch.bfloat16
     compile = False  # default False for compatibility
     output_path = "example.png"
     height = 1024
     width = 1024
-    num_inference_steps = 8
+    num_inference_steps = 40
     guidance_scale = 0.0
     seed = 42
     attn_backend = os.environ.get("ZIMAGE_ATTENTION", "_native_flash")
