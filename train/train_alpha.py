@@ -8,7 +8,7 @@ import math
 import random
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -16,7 +16,7 @@ from safetensors.torch import load_file, save_file
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -33,45 +33,75 @@ class RGBATextDataset(Dataset):
     def __init__(
         self,
         root: str | Path,
-        height: int,
-        width: int,
-        random_crop: bool = True,
+        buckets: Sequence[Tuple[int, int]],
+        object_fill_min: float = 0.75,
+        object_fill_max: float = 0.95,
+        position_jitter: float = 0.05,
         horizontal_flip: bool = True,
     ) -> None:
         self.root = Path(root)
-        self.height = height
-        self.width = width
-        self.random_crop = random_crop
+        self.buckets = list(buckets)
+        self.object_fill_min = object_fill_min
+        self.object_fill_max = object_fill_max
+        self.position_jitter = position_jitter
         self.horizontal_flip = horizontal_flip
 
         images = sorted(path for path in self.root.iterdir() if path.is_file() and path.suffix.lower() == ".png")
-        self.samples = [(path, path.with_suffix(".txt")) for path in images if path.with_suffix(".txt").is_file()]
+        self.samples = []
+        self.bucket_indices: List[List[int]] = [[] for _ in self.buckets]
+        for image_path in images:
+            text_path = image_path.with_suffix(".txt")
+            if not text_path.is_file():
+                continue
+            with Image.open(image_path) as source:
+                alpha_bbox = source.convert("RGBA").getchannel("A").getbbox()
+            if alpha_bbox is None:
+                continue
+            object_width = alpha_bbox[2] - alpha_bbox[0]
+            object_height = alpha_bbox[3] - alpha_bbox[1]
+            bucket_id = self._nearest_bucket(object_width / object_height)
+            sample_id = len(self.samples)
+            self.samples.append((image_path, text_path, alpha_bbox, bucket_id))
+            self.bucket_indices[bucket_id].append(sample_id)
         if not self.samples:
-            raise ValueError(f"No matching PNG/TXT pairs found in {self.root}")
+            raise ValueError(f"No non-empty matching RGBA PNG/TXT pairs found in {self.root}")
+
+    def _nearest_bucket(self, aspect_ratio: float) -> int:
+        # Log distance treats portrait and landscape ratios symmetrically.
+        return min(
+            range(len(self.buckets)),
+            key=lambda index: abs(math.log(aspect_ratio) - math.log(self.buckets[index][0] / self.buckets[index][1])),
+        )
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _resize_and_crop(self, image: Image.Image) -> Image.Image:
-        scale = max(self.width / image.width, self.height / image.height)
-        resized_width = max(self.width, round(image.width * scale))
-        resized_height = max(self.height, round(image.height * scale))
-        image = image.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+    def _fit_object(self, image: Image.Image, alpha_bbox: Tuple[int, int, int, int], bucket_id: int) -> Image.Image:
+        object_image = image.crop(alpha_bbox)
+        width, height = self.buckets[bucket_id]
+        fill = random.uniform(self.object_fill_min, self.object_fill_max)
+        scale = min(width * fill / object_image.width, height * fill / object_image.height)
+        resized_width = max(1, min(width, round(object_image.width * scale)))
+        resized_height = max(1, min(height, round(object_image.height * scale)))
+        object_image = object_image.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
 
-        max_left = resized_width - self.width
-        max_top = resized_height - self.height
-        if self.random_crop:
-            left = random.randint(0, max_left) if max_left else 0
-            top = random.randint(0, max_top) if max_top else 0
-        else:
-            left = max_left // 2
-            top = max_top // 2
-        return image.crop((left, top, left + self.width, top + self.height))
+        available_x = width - resized_width
+        available_y = height - resized_height
+        center_x = available_x // 2
+        center_y = available_y // 2
+        jitter_x = round(random.uniform(-1.0, 1.0) * self.position_jitter * width)
+        jitter_y = round(random.uniform(-1.0, 1.0) * self.position_jitter * height)
+        left = min(max(center_x + jitter_x, 0), available_x)
+        top = min(max(center_y + jitter_y, 0), available_y)
+
+        canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        canvas.alpha_composite(object_image, (left, top))
+        return canvas
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor | str]:
-        image_path, text_path = self.samples[index]
+        image_path, text_path, alpha_bbox, bucket_id = self.samples[index]
         with Image.open(image_path) as source:
-            image = self._resize_and_crop(source.convert("RGBA"))
+            image = self._fit_object(source.convert("RGBA"), alpha_bbox, bucket_id)
 
         if self.horizontal_flip and random.random() < 0.5:
             image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
@@ -83,7 +113,58 @@ class RGBATextDataset(Dataset):
         # Restore the dataset invariant while retaining colors on soft edges.
         rgb = rgb * (alpha > 0).to(rgb.dtype)
         caption = text_path.read_text(encoding="utf-8").strip()
-        return {"rgb": rgb, "alpha": alpha, "caption": caption}
+        return {"rgb": rgb, "alpha": alpha, "caption": caption, "bucket_id": bucket_id}
+
+
+class AspectRatioBatchSampler(Sampler[List[int]]):
+    """Shuffle samples while keeping every batch inside a single size bucket."""
+
+    def __init__(self, bucket_indices: Sequence[Sequence[int]], batch_size: int, drop_last: bool = False) -> None:
+        self.bucket_indices = [list(indices) for indices in bucket_indices]
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+
+    def __iter__(self) -> Iterator[List[int]]:
+        batches = []
+        for indices in self.bucket_indices:
+            indices = indices.copy()
+            random.shuffle(indices)
+            for start in range(0, len(indices), self.batch_size):
+                batch = indices[start : start + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append(batch)
+        random.shuffle(batches)
+        yield from batches
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return sum(len(indices) // self.batch_size for indices in self.bucket_indices)
+        return sum(math.ceil(len(indices) / self.batch_size) for indices in self.bucket_indices if indices)
+
+
+def make_default_buckets(height: int, width: int, multiple: int = 16) -> List[Tuple[int, int]]:
+    """Build equal-area buckets spanning object aspect ratios from 1:2 to 2:1."""
+    target_area = height * width
+    buckets = set()
+    for ratio in (0.5, 2 / 3, 0.8, 1.0, 1.25, 1.5, 2.0):
+        bucket_width = round(math.sqrt(target_area * ratio) / multiple) * multiple
+        bucket_height = round(math.sqrt(target_area / ratio) / multiple) * multiple
+        buckets.add((max(multiple, bucket_width), max(multiple, bucket_height)))
+    buckets.add((width, height))
+    return sorted(buckets, key=lambda size: size[0] / size[1])
+
+
+def parse_buckets(specification: str | None, height: int, width: int) -> List[Tuple[int, int]]:
+    if not specification:
+        return make_default_buckets(height, width)
+    buckets = []
+    for item in specification.split(","):
+        try:
+            bucket_width, bucket_height = (int(value.strip()) for value in item.lower().split("x", 1))
+        except ValueError as error:
+            raise ValueError(f"Invalid bucket {item!r}; expected WIDTHxHEIGHT.") from error
+        buckets.append((bucket_width, bucket_height))
+    return buckets
 
 
 class DecoderTrainingWrapper(nn.Module):
@@ -106,6 +187,14 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
+    parser.add_argument(
+        "--buckets",
+        default=None,
+        help="Comma-separated WIDTHxHEIGHT buckets. Default: seven equal-area aspect buckets around height/width.",
+    )
+    parser.add_argument("--object-fill-min", type=float, default=0.75)
+    parser.add_argument("--object-fill-max", type=float, default=0.95)
+    parser.add_argument("--position-jitter", type=float, default=0.05)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=None)
@@ -113,7 +202,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-sequence-length", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--no-random-crop", action="store_true")
     parser.add_argument("--no-horizontal-flip", action="store_true")
 
     parser.add_argument("--transformer-train-mode", choices=("full", "last", "none"), default="full")
@@ -346,20 +434,29 @@ def main() -> None:
     set_seed(args.seed)
     set_attention_backend(args.attention_backend)
 
+    buckets = parse_buckets(args.buckets, args.height, args.width)
+    if not 0 < args.object_fill_min <= args.object_fill_max <= 1:
+        raise ValueError("Object fill values must satisfy 0 < min <= max <= 1.")
+    if not 0 <= args.position_jitter <= 1:
+        raise ValueError("--position-jitter must be within [0, 1].")
+    for bucket_width, bucket_height in buckets:
+        if bucket_width % 16 or bucket_height % 16:
+            raise ValueError(f"Bucket {bucket_width}x{bucket_height} is not divisible by 16.")
+
     dataset = RGBATextDataset(
         args.data_dir,
-        args.height,
-        args.width,
-        random_crop=not args.no_random_crop,
+        buckets,
+        object_fill_min=args.object_fill_min,
+        object_fill_max=args.object_fill_max,
+        position_jitter=args.position_jitter,
         horizontal_flip=not args.no_horizontal_flip,
     )
+    batch_sampler = AspectRatioBatchSampler(dataset.bucket_indices, args.batch_size)
     dataloader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
+        batch_sampler=batch_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=False,
     )
 
     model_dtype = torch.float32
@@ -381,11 +478,15 @@ def main() -> None:
 
     vae_scale = 2 ** (len(vae.config.block_out_channels) - 1)
     required_multiple = vae_scale * transformer.all_patch_size[0]
-    if args.height % required_multiple or args.width % required_multiple:
-        raise ValueError(
-            f"Training height and width must be divisible by {required_multiple}; "
-            f"got {args.height}x{args.width}."
+    invalid_buckets = [size for size in buckets if size[0] % required_multiple or size[1] % required_multiple]
+    if invalid_buckets:
+        raise ValueError(f"Buckets must be divisible by {required_multiple}; invalid buckets: {invalid_buckets}")
+    if accelerator.is_main_process:
+        distribution = ", ".join(
+            f"{width}x{height}:{len(dataset.bucket_indices[index])}"
+            for index, (width, height) in enumerate(buckets)
         )
+        print(f"Loaded {len(dataset)} samples into aspect buckets: {distribution}")
 
     set_trainable_parameters(
         transformer,

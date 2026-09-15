@@ -26,6 +26,23 @@ D:\Miniconda\envs\Steel\python.exe train\train_alpha.py `
   --batch-size 1 --gradient-accumulation-steps 4
 ```
 
+The trainer uses aspect-ratio bucketing by default. `--height` and `--width`
+define the approximate pixel area rather than forcing every sample to that exact
+shape. Seven equal-area buckets from 1:2 portrait through 2:1 landscape are
+created automatically. The nontransparent alpha bounds are detected, the object
+is resized without distortion, and it is placed on a transparent bucket canvas.
+Every batch contains only one resolution.
+
+To choose the resolutions explicitly:
+
+```powershell
+--buckets "368x720,416x624,464x560,512x512,560x464,624x416,720x368"
+```
+
+Every bucket dimension must be divisible by 16. `--object-fill-min 0.75` and
+`--object-fill-max 0.95` randomize object occupancy; `--position-jitter 0.05`
+prevents the model from learning an overly rigid exact center.
+
 Useful lower-memory variants:
 
 ```powershell
