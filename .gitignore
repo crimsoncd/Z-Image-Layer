@@ -12,6 +12,7 @@ __pycache__/
 # C extensions
 *.so
 outputs/
+logs/
 prompts/
 # Distribution / packaging
 .Python

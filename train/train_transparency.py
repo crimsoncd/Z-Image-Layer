@@ -11,6 +11,11 @@ Stage 2:
 Stage 1 freezes the RGB VAE and learns an RGBA latent offset/decoder. Stage 2
 freezes that codec and trains attention LoRA with Z-Image's flow time/sign
 convention. --init-lora is a weights-only warm start, not optimizer resume.
+
+Console output and timing summaries are saved automatically in REPO_ROOT/logs/.
+Each process gets its own timestamped log. Average step time counts optimizer
+updates and includes data loading and periodic saves, excluding initialization
+and finalization. Logged losses describe the latest local microbatch.
 """
 
 import argparse
@@ -27,6 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT))
 
+from train.training_log import record_training
 from train.rgba_data import RGBATextDataset, AspectRatioBatchSampler, encode_captions, parse_buckets
 from utils import load_from_local_dir, set_attention_backend
 from utils.loader import load_config, load_sharded_safetensors
@@ -105,122 +111,145 @@ def fp32_context(device):
     return torch.autocast(device_type=device.type, enabled=False) if device.type in ("cuda", "cpu") else nullcontext()
 
 
-def main():
+def train(args, run):
     from accelerate import Accelerator, DataLoaderConfiguration
     from accelerate.utils import set_seed
 
-    args = parse_args()
-    # Different aspect buckets cannot be concatenated into a dispatch batch.
-    accelerator = Accelerator(
-        mixed_precision=args.mixed_precision if args.stage == "flow" else "no",
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        dataloader_config=DataLoaderConfiguration(split_batches=False, dispatch_batches=False),
-    )
-    set_seed(args.seed)
-    set_attention_backend(args.attention_backend)
-    device = accelerator.device
-    components = None
-    if args.stage == "flow":
-        components = load_from_local_dir(args.model_dir, device=str(device),
-                                         dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32)
-        base_vae = components["vae"]
-    else:
-        base_vae = load_rgb_vae(args.model_dir, device)
-    codec = (LatentTransparencyVAE.from_pretrained(base_vae, args.codec_dir) if args.codec_dir else
-             LatentTransparencyVAE(base_vae, TransparencyConfig(
-                 base_vae.config.latent_channels, 2 ** (len(base_vae.config.block_out_channels) - 1),
-                 args.hidden_channels, args.offset_scale)))
+    with run.phase("accelerator setup"):
+        # Different aspect buckets cannot be concatenated into a dispatch batch.
+        accelerator = Accelerator(
+            mixed_precision=args.mixed_precision if args.stage == "flow" else "no",
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            dataloader_config=DataLoaderConfiguration(split_batches=False, dispatch_batches=False),
+        )
+        set_seed(args.seed)
+        set_attention_backend(args.attention_backend)
+        device = accelerator.device
+    synchronize = (lambda: torch.cuda.synchronize(device)) if device.type == "cuda" else None
+    print(f"Runtime: device={device}, processes={accelerator.num_processes}, "
+          f"rank={accelerator.process_index}, precision={accelerator.mixed_precision}, torch={torch.__version__}")
+    with run.phase("model loading", synchronize):
+        components = None
+        if args.stage == "flow":
+            components = load_from_local_dir(args.model_dir, device=str(device),
+                                             dtype=torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32)
+            base_vae = components["vae"]
+        else:
+            base_vae = load_rgb_vae(args.model_dir, device)
+        codec = (LatentTransparencyVAE.from_pretrained(base_vae, args.codec_dir) if args.codec_dir else
+                 LatentTransparencyVAE(base_vae, TransparencyConfig(
+                     base_vae.config.latent_channels, 2 ** (len(base_vae.config.block_out_channels) - 1),
+                     args.hidden_channels, args.offset_scale)))
 
-    buckets = parse_buckets(args.buckets, args.height, args.width)
-    patch_size = components["transformer"].all_patch_size[0] if components else 2
-    multiple = codec.transparency_config.scale_factor * patch_size
-    if any(w < multiple or h < multiple or w % multiple or h % multiple for w, h in buckets):
-        raise ValueError(f"Bucket dimensions must be positive multiples of {multiple}.")
-    dataset = RGBATextDataset(args.data_dir, buckets)
-    loader = DataLoader(dataset, batch_sampler=AspectRatioBatchSampler(dataset.bucket_indices, args.batch_size),
-                        num_workers=args.num_workers, pin_memory=device.type == "cuda")
-    lora_config = None
-    if args.stage == "flow":
-        codec.requires_grad_(False).eval()
-        components["text_encoder"].requires_grad_(False).eval()
-        model = components["transformer"]
-        if model.in_channels != codec.transparency_config.latent_channels:
-            raise ValueError("DiT and VAE latent channel counts differ.")
-        lora_config = (load_transparency_lora(model, args.init_lora) if args.init_lora else
-                       install_transparency_lora(model, args.lora_rank, args.lora_alpha))
-    else:
-        model = codec
-    parameters = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(parameters, lr=args.learning_rate or (1e-4 if args.stage == "codec" else 1e-5))
-    model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
-    if len(loader) == 0:
-        raise ValueError("Training loader is empty on this process.")
-    model.train()
+    with run.phase("dataset preparation"):
+        buckets = parse_buckets(args.buckets, args.height, args.width)
+        patch_size = components["transformer"].all_patch_size[0] if components else 2
+        multiple = codec.transparency_config.scale_factor * patch_size
+        if any(w < multiple or h < multiple or w % multiple or h % multiple for w, h in buckets):
+            raise ValueError(f"Bucket dimensions must be positive multiples of {multiple}.")
+        dataset = RGBATextDataset(args.data_dir, buckets)
+        loader = DataLoader(dataset, batch_sampler=AspectRatioBatchSampler(dataset.bucket_indices, args.batch_size),
+                            num_workers=args.num_workers, pin_memory=device.type == "cuda")
+        print(f"Dataset: samples={len(dataset)}, batches_before_sharding={len(loader)}")
+        print("Bucket sample counts: " + json.dumps({f"{w}x{h}": len(indices)
+              for (w, h), indices in zip(buckets, dataset.bucket_indices)}))
+    with run.phase("optimizer and distributed preparation", synchronize):
+        lora_config = None
+        if args.stage == "flow":
+            codec.requires_grad_(False).eval()
+            components["text_encoder"].requires_grad_(False).eval()
+            model = components["transformer"]
+            if model.in_channels != codec.transparency_config.latent_channels:
+                raise ValueError("DiT and VAE latent channel counts differ.")
+            lora_config = (load_transparency_lora(model, args.init_lora) if args.init_lora else
+                           install_transparency_lora(model, args.lora_rank, args.lora_alpha))
+        else:
+            model = codec
+        parameters = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(parameters, lr=args.learning_rate or (1e-4 if args.stage == "codec" else 1e-5))
+        model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
+        if len(loader) == 0:
+            raise ValueError("Training loader is empty on this process.")
+        print(f"Training: trainable_parameters={sum(p.numel() for p in parameters)}, "
+              f"learning_rate={optimizer.param_groups[0]['lr']}, batches_per_process={len(loader)}, "
+              f"nominal_effective_batch_size={args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps}")
+        model.train()
     step = 0
 
     def save(step):
-        accelerator.wait_for_everyone()
-        if accelerator.is_main_process:
-            directory = args.output_dir / f"checkpoint-{step}"
-            raw_model = accelerator.unwrap_model(model)
-            (raw_model if args.stage == "codec" else codec).save_pretrained(directory)
-            if args.stage == "flow":
-                save_transparency_lora(raw_model, lora_config, directory)
-            config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
-            config["global_step"] = step
-            (directory / "training_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
-        accelerator.wait_for_everyone()
+        with run.phase(f"checkpoint-{step}", synchronize):
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                directory = args.output_dir / f"checkpoint-{step}"
+                raw_model = accelerator.unwrap_model(model)
+                (raw_model if args.stage == "codec" else codec).save_pretrained(directory)
+                if args.stage == "flow":
+                    save_transparency_lora(raw_model, lora_config, directory)
+                config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
+                config["global_step"] = step
+                (directory / "training_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+            accelerator.wait_for_everyone()
 
-    optimizer.zero_grad(set_to_none=True)
-    epoch = 0
-    while step < args.max_steps:
-        if hasattr(loader, "set_epoch"):
-            loader.set_epoch(epoch)
-        for batch in loader:
-            rgb = batch["rgb"].to(device=device, dtype=torch.float32)
-            alpha = batch["alpha"].to(device=device, dtype=torch.float32)
-            with accelerator.accumulate(model):
-                if args.stage == "codec":
-                    outputs = model(rgb, alpha)
-                    losses = transparency_losses(outputs, rgb, alpha)
-                    loss = sum(getattr(args, f"{name}_weight") * value for name, value in losses.items())
-                else:
-                    with torch.no_grad():
-                        with fp32_context(device):
-                            clean = codec.to_diffusion(codec.encode_rgba(rgb, alpha))
-                        captions = encode_captions(list(batch["caption"]), components["tokenizer"],
-                                                   components["text_encoder"], device,
-                                                   args.max_sequence_length, args.caption_dropout)
-                    # Continuous logit-normal flow sampling: sigma=1 is noise,
-                    # model time=1-sigma; pipeline negates the predicted velocity.
-                    sigma = torch.randn(clean.shape[0], device=device).sigmoid().view(-1, 1, 1, 1)
-                    noise = torch.randn_like(clean)
-                    noisy = (1 - sigma) * clean + sigma * noise
-                    model_time = 1 - sigma.flatten()
-                    model_dtype = next(accelerator.unwrap_model(model).parameters()).dtype
-                    with accelerator.autocast():
-                        prediction = model(list(noisy.to(model_dtype).unsqueeze(2).unbind(0)), model_time, captions)[0]
-                        prediction = torch.stack(prediction).squeeze(2).float()
-                        loss = F.mse_loss(prediction, clean - noise)
-                    losses = {"flow": loss}
-                accelerator.backward(loss)
+    with run.phase("training", synchronize):
+        optimizer.zero_grad(set_to_none=True)
+        epoch = 0
+        while step < args.max_steps:
+            if hasattr(loader, "set_epoch"):
+                loader.set_epoch(epoch)
+            for batch in loader:
+                rgb = batch["rgb"].to(device=device, dtype=torch.float32)
+                alpha = batch["alpha"].to(device=device, dtype=torch.float32)
+                with accelerator.accumulate(model):
+                    if args.stage == "codec":
+                        outputs = model(rgb, alpha)
+                        losses = transparency_losses(outputs, rgb, alpha)
+                        loss = sum(getattr(args, f"{name}_weight") * value for name, value in losses.items())
+                    else:
+                        with torch.no_grad():
+                            with fp32_context(device):
+                                clean = codec.to_diffusion(codec.encode_rgba(rgb, alpha))
+                            captions = encode_captions(list(batch["caption"]), components["tokenizer"],
+                                                       components["text_encoder"], device,
+                                                       args.max_sequence_length, args.caption_dropout)
+                        # Continuous logit-normal flow sampling: sigma=1 is noise,
+                        # model time=1-sigma; pipeline negates the predicted velocity.
+                        sigma = torch.randn(clean.shape[0], device=device).sigmoid().view(-1, 1, 1, 1)
+                        noise = torch.randn_like(clean)
+                        noisy = (1 - sigma) * clean + sigma * noise
+                        model_time = 1 - sigma.flatten()
+                        model_dtype = next(accelerator.unwrap_model(model).parameters()).dtype
+                        with accelerator.autocast():
+                            prediction = model(list(noisy.to(model_dtype).unsqueeze(2).unbind(0)), model_time, captions)[0]
+                            prediction = torch.stack(prediction).squeeze(2).float()
+                            loss = F.mse_loss(prediction, clean - noise)
+                        losses = {"flow": loss}
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(parameters, args.max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(parameters, args.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            if accelerator.sync_gradients:
-                step += 1
-                if step % args.log_every == 0:
-                    accelerator.print(f"step={step}/{args.max_steps} " + " ".join(
-                        f"{name}={value.detach().item():.5f}" for name, value in losses.items()))
-                if step % args.save_every == 0:
-                    save(step)
-                if step >= args.max_steps:
-                    break
-        epoch += 1
-    if step % args.save_every:
-        save(step)
-    accelerator.end_training()
+                    step += 1
+                    run.steps = step
+                    if step % args.log_every == 0 or step == args.max_steps:
+                        accelerator.print(f"step={step}/{args.max_steps} loss={loss.detach().item():.5f} "
+                                          f"lr={optimizer.param_groups[0]['lr']:.6g} " + " ".join(
+                            f"{name}={value.detach().item():.5f}" for name, value in losses.items()))
+                    if step % args.save_every == 0:
+                        save(step)
+                    if step >= args.max_steps:
+                        break
+            epoch += 1
+    with run.phase("finalization", synchronize):
+        if step % args.save_every:
+            save(step)
+        accelerator.end_training()
+
+
+def main():
+    args = parse_args()
+    with record_training(args, REPO_ROOT / "logs") as run:
+        train(args, run)
 
 
 if __name__ == "__main__":
