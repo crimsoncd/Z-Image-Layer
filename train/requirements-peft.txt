@@ -1,0 +1,2 @@
+# Install into the server training environment, not an actively running job.
+peft==0.21.0
