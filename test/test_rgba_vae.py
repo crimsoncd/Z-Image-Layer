@@ -16,7 +16,8 @@ from PIL import Image, ImageDraw
 import torch
 from torch.nn import functional as F
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+# sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+sys.path.insert(0, "/remote-home/Zhangkaile/dev/Z-Image-Layer/src")
 
 from utils.loader import load_config, load_sharded_safetensors
 from zimage.autoencoder import AutoencoderKL
@@ -60,9 +61,9 @@ def main():
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--image", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/reconstruction"))
+    parser.add_argument("--output-dir", type=Path, default=Path("test/reconstruction"))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--max-side", type=int, help="Optionally shrink the longest side; never upscale.")
+    parser.add_argument("--max-side", type=int, default=512, help="Optionally shrink the longest side; never upscale.")
     parser.add_argument("--error-gain", type=float, default=5.0, help="Fixed amplification for error panels only.")
     args = parser.parse_args()
     if args.max_side is not None and args.max_side < 1:

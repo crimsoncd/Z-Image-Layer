@@ -3,6 +3,9 @@
 local_dev_tips.md
 tmp/
 
+test/reconstruction/
+local_run.sh
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
