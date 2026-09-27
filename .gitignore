@@ -5,6 +5,7 @@ tmp/
 
 test/reconstruction/
 local_run.sh
+local_run_2.sh
 
 
 # Byte-compiled / optimized / DLL files
